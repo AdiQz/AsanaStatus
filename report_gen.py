@@ -37,13 +37,13 @@ class AsanaAPI:
             # Filter tasks where Team == ASANA_TEAM_NAME and tag != "Not a bug"
             for task in tasks:
                 team_matches = False
-                tag_is_not_bug = False
+                tag_is_not_bug = True
                 
                 for field in task.get("custom_fields", []):
                     if field.get("name") == "Team" and field.get("display_value") == self.team_name:
                         team_matches = True
-                    elif field.get("name") == "tag" and field.get("display_value") != "Not a bug":
-                        tag_is_not_bug = True
+                    # elif field.get("name") == "tag" and field.get("display_value") != "Not a bug":
+                    #     tag_is_not_bug = True
                 
                 # Only include task if both conditions are met
                 if team_matches and tag_is_not_bug:
