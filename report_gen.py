@@ -1,139 +1,190 @@
 import os
 import requests
-import json
 import datetime
-from dateutil.relativedelta import relativedelta
 
-BASE_URL = "https://app.asana.com/api/1.0"
+PLANE_BASE_URL = "https://plane-tracker.internal.quizizz.com"
+PLANE_WORKSPACE_SLUG = "bugs"
+PLANE_PROJECT_ID = "7dbe5492-45fa-4989-8c3c-dae60cbd7c28"
 
 
-class AsanaAPI:
+class PlaneAPI:
     def __init__(self):
-        """Initialize Asana API with environment variables"""
-        self.token = os.getenv("ASANA_ACCESS_TOKEN")
-        self.section_id = os.getenv("ASANA_SECTION_ID")
-        self.team_name = os.getenv("ASANA_TEAM_NAME", "Engagement")  # Default: "Engagement"
-        self.priority_field = os.getenv("ASANA_PRIORITY_FIELD", "Priority")  # Default: "Priority"
+        self.api_key = os.getenv("PLANE_API_KEY", "plane_api_6a6627c951804629a00a4b66fc322a60")
+        self.workspace_slug = PLANE_WORKSPACE_SLUG
+        self.project_id = PLANE_PROJECT_ID
+        self.team_label = os.getenv("PLANE_TEAM_LABEL", "team:Engagement")
 
-        if not self.token:
-            raise ValueError("ASANA_ACCESS_TOKEN is required in environment variables")
-        if not self.section_id:
-            raise ValueError("ASANA_SECTION_ID is required in environment variables")
+        self.headers = {
+            "X-API-Key": self.api_key,
+            "Content-Type": "application/json",
+        }
 
-        self.headers = {"Authorization": f"Bearer {self.token}"}
+        self._engagement_label_id = None
+        self._completed_state_ids = None
+        self._member_map = None
 
-    def fetch_tasks_with_pagination(self, url):
-        """Fetch tasks from Asana with pagination"""
-        all_tasks = []
+    def _issues_url(self):
+        return f"{PLANE_BASE_URL}/api/v1/workspaces/{self.workspace_slug}/projects/{self.project_id}/issues/"
 
-        while url:
-            response = requests.get(url, headers=self.headers)
+    def _get_engagement_label_id(self):
+        if self._engagement_label_id:
+            return self._engagement_label_id
+
+        url = f"{PLANE_BASE_URL}/api/v1/workspaces/{self.workspace_slug}/projects/{self.project_id}/labels/"
+        response = requests.get(url, headers=self.headers)
+        if response.status_code != 200:
+            raise Exception(f"Failed to fetch labels: {response.status_code} {response.text}")
+
+        data = response.json()
+        labels = data if isinstance(data, list) else data.get("results", [])
+        for label in labels:
+            if label.get("name") == self.team_label:
+                self._engagement_label_id = label["id"]
+                return self._engagement_label_id
+
+        raise ValueError(f"Label '{self.team_label}' not found in project")
+
+    def _get_completed_state_ids(self):
+        if self._completed_state_ids is not None:
+            return self._completed_state_ids
+
+        url = f"{PLANE_BASE_URL}/api/v1/workspaces/{self.workspace_slug}/projects/{self.project_id}/states/"
+        response = requests.get(url, headers=self.headers)
+        if response.status_code != 200:
+            raise Exception(f"Failed to fetch states: {response.status_code} {response.text}")
+
+        data = response.json()
+        states = data if isinstance(data, list) else data.get("results", [])
+        self._completed_state_ids = {
+            s["id"] for s in states if s.get("group") in ("completed", "cancelled")
+        }
+        return self._completed_state_ids
+
+    def _get_member_map(self):
+        if self._member_map is not None:
+            return self._member_map
+
+        url = f"{PLANE_BASE_URL}/api/v1/workspaces/{self.workspace_slug}/members/"
+        response = requests.get(url, headers=self.headers)
+        if response.status_code != 200:
+            raise Exception(f"Failed to fetch members: {response.status_code} {response.text}")
+
+        data = response.json()
+        members = data if isinstance(data, list) else data.get("results", [])
+        self._member_map = {}
+        for entry in members:
+            # Plane wraps member info under a "member" key in workspace members
+            member = entry.get("member", entry)
+            mid = member.get("id")
+            display_name = (
+                member.get("display_name")
+                or f"{member.get('first_name', '')} {member.get('last_name', '')}".strip()
+                or "Unknown"
+            )
+            if mid:
+                self._member_map[mid] = display_name
+
+        return self._member_map
+
+    def fetch_all_issues(self):
+        """Fetch all issues tagged with the Engagement label (paginated, filtered client-side)."""
+        label_id = self._get_engagement_label_id()
+        matching_issues = []
+        cursor = None
+
+        while True:
+            params = {"per_page": 100}
+            if cursor:
+                params["cursor"] = cursor
+
+            response = requests.get(self._issues_url(), headers=self.headers, params=params)
             if response.status_code != 200:
-                raise Exception(f"API request failed: {response.status_code}")
+                raise Exception(f"Failed to fetch issues: {response.status_code} {response.text}")
 
             data = response.json()
-            tasks = data.get("data", [])
+            results = data.get("results", [])
 
-            # Filter tasks where Team == ASANA_TEAM_NAME and tag != "Not a bug"
-            for task in tasks:
-                team_matches = False
-                tag_is_not_bug = True
-                
-                for field in task.get("custom_fields", []):
-                    if field.get("name") == "Team" and field.get("display_value") == self.team_name:
-                        team_matches = True
-                    # elif field.get("name") == "tag" and field.get("display_value") != "Not a bug":
-                    #     tag_is_not_bug = True
-                
-                # Only include task if both conditions are met
-                if team_matches and tag_is_not_bug:
-                    all_tasks.append(task)
+            for issue in results:
+                if label_id in issue.get("labels", []):
+                    matching_issues.append(issue)
 
-            # Handle pagination
-            next_page = data.get("next_page")
-            if next_page:
-                url = f"{BASE_URL}/sections/{self.section_id}/tasks?opt_fields=custom_fields,created_at,completed,assignee.name&offset={next_page['offset']}&limit=50"
-            else:
-                url = ""
+            if not data.get("next_page_results"):
+                break
+            cursor = data.get("next_cursor")
+            if not cursor:
+                break
 
-        return all_tasks
+        return matching_issues
 
     def get_pending_tasks(self):
-        """Fetch the number of incomplete tasks in a section"""
-        url = f"{BASE_URL}/sections/{self.section_id}/tasks?limit=50&opt_fields=completed,custom_fields,assignee.name,created_at"
-        tasks = self.fetch_tasks_with_pagination(url)
-        return sum(1 for task in tasks if not task.get("completed", False))
+        """Count incomplete issues."""
+        issues = self.fetch_all_issues()
+        completed_ids = self._get_completed_state_ids()
+        return sum(1 for issue in issues if issue.get("state") not in completed_ids)
 
     def get_incoming_tasks_grouped_by_priority(self):
-        """Fetch tasks created this month and group them by Priority"""
-        url = f"{BASE_URL}/sections/{self.section_id}/tasks?limit=50&opt_fields=custom_fields,created_at"
-        tasks = self.fetch_tasks_with_pagination(url)
-
+        """Issues created this month grouped by priority."""
+        issues = self.fetch_all_issues()
         current_month = datetime.datetime.utcnow().strftime("%Y-%m")
-        priority_counts = {}
 
-        for task in tasks:
-            created_at = task.get("created_at")
+        priority_counts = {}
+        for issue in issues:
+            created_at = issue.get("created_at", "")
             if not created_at:
                 continue
-
-            task_date = datetime.datetime.strptime(created_at, "%Y-%m-%dT%H:%M:%S.%fZ")
+            task_date = datetime.datetime.strptime(created_at[:19], "%Y-%m-%dT%H:%M:%S")
             if task_date.strftime("%Y-%m") != current_month:
                 continue
-
-            for field in task.get("custom_fields", []):
-                if field.get("name") == self.priority_field:
-                    priority_counts[field.get("display_value", "Unknown")] = (
-                            priority_counts.get(field.get("display_value", "Unknown"), 0) + 1
-                    )
+            priority = issue.get("priority") or "none"
+            priority_counts[priority] = priority_counts.get(priority, 0) + 1
 
         return sorted(priority_counts.items(), key=lambda x: x[1], reverse=True)
 
     def get_tasks_grouped_by_priority(self):
-        """Fetch tasks and group them by Priority (ONLY INCOMPLETE TASKS)"""
-        url = f"{BASE_URL}/sections/{self.section_id}/tasks?limit=50&opt_fields=custom_fields,completed"
-        tasks = self.fetch_tasks_with_pagination(url)
+        """Incomplete issues grouped by priority."""
+        issues = self.fetch_all_issues()
+        completed_ids = self._get_completed_state_ids()
 
         priority_counts = {}
-
-        for task in tasks:
-            if task.get("completed", False):
+        for issue in issues:
+            if issue.get("state") in completed_ids:
                 continue
-
-            for field in task.get("custom_fields", []):
-                if field.get("name") == self.priority_field:
-                    priority_counts[field.get("display_value", "Unknown")] = (
-                            priority_counts.get(field.get("display_value", "Unknown"), 0) + 1
-                    )
+            priority = issue.get("priority") or "none"
+            priority_counts[priority] = priority_counts.get(priority, 0) + 1
 
         return priority_counts
 
     def get_tasks_grouped_by_assignee(self):
-        """Fetch tasks and group them by Assignee (ONLY INCOMPLETE TASKS)"""
-        url = f"{BASE_URL}/sections/{self.section_id}/tasks?limit=50&opt_fields=custom_fields,created_at,assignee.name,completed"
-        tasks = self.fetch_tasks_with_pagination(url)
+        """Incomplete issues grouped by assignee name."""
+        issues = self.fetch_all_issues()
+        completed_ids = self._get_completed_state_ids()
+        member_map = self._get_member_map()
 
         assignee_counts = {}
-
-        for task in tasks:
-            if task.get("completed", False):
+        for issue in issues:
+            if issue.get("state") in completed_ids:
                 continue
-
-            assignee = task.get("assignee") or {}
-            assignee_name = assignee.get("name", "Unassigned")  # Default: "Unassigned"
-
-            assignee_counts[assignee_name] = assignee_counts.get(assignee_name, 0) + 1
+            assignees = issue.get("assignees", [])
+            if not assignees:
+                assignee_counts["Unassigned"] = assignee_counts.get("Unassigned", 0) + 1
+            else:
+                for assignee_id in assignees:
+                    name = member_map.get(assignee_id, "Unknown")
+                    assignee_counts[name] = assignee_counts.get(name, 0) + 1
 
         return sorted(assignee_counts.items(), key=lambda x: x[1], reverse=True)
 
 
 def send_slack_message(slack_message):
     payload = {
-        "channel": os.environ['channel_id'],
-        "text": slack_message
+        "channel": os.environ["channel_id"],
+        "text": slack_message,
     }
-    slack_url = os.environ['slack_url']
-    slack_headers = {"Content-Type": "application/json", "Authorization": f"Bearer {os.environ['slack_token']}"}
+    slack_url = os.environ["slack_url"]
+    slack_headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {os.environ['slack_token']}",
+    }
 
     response = requests.post(slack_url, headers=slack_headers, json=payload)
 
@@ -146,21 +197,20 @@ def send_slack_message(slack_message):
     else:
         print(f"Request failed with status code {response.status_code}: {response.text}")
 
-def main():
-    """Main function to execute the Asana API queries"""
-    asana_api = AsanaAPI()
 
+def main():
+    plane_api = PlaneAPI()
     slack_message = ""
 
     try:
-        pending_tasks = asana_api.get_pending_tasks()
+        pending_tasks = plane_api.get_pending_tasks()
         slack_message += f"📌 *Pending Tasks:* {pending_tasks}\n"
     except Exception as e:
         slack_message += f"⚠️ Error fetching pending tasks: {e}\n"
 
     try:
-        incoming_priority_tasks = asana_api.get_incoming_tasks_grouped_by_priority()
-        slack_message += "\n📥 *Incoming Tasks ("+ datetime.datetime.utcnow().strftime("%Y-%m") + ") grouped by Priority:*\n"
+        incoming_priority_tasks = plane_api.get_incoming_tasks_grouped_by_priority()
+        slack_message += "\n📥 *Incoming Tasks (" + datetime.datetime.utcnow().strftime("%Y-%m") + ") grouped by Priority:*\n"
         if not incoming_priority_tasks:
             slack_message += "   - 0\n"
         else:
@@ -170,7 +220,7 @@ def main():
         slack_message += f"⚠️ Error fetching incoming tasks by priority: {e}\n"
 
     try:
-        priority_tasks = asana_api.get_tasks_grouped_by_priority()
+        priority_tasks = plane_api.get_tasks_grouped_by_priority()
         slack_message += "\n🔥 *Tasks grouped by Priority:*\n"
         for priority, count in priority_tasks.items():
             slack_message += f"   - {priority}: {count}\n"
@@ -178,15 +228,14 @@ def main():
         slack_message += f"⚠️ Error fetching tasks by priority: {e}\n"
 
     try:
-        assignee_tasks = asana_api.get_tasks_grouped_by_assignee()
+        assignee_tasks = plane_api.get_tasks_grouped_by_assignee()
         slack_message += "\n👥 *Tasks grouped by Assignee:*\n"
         for assignee, count in assignee_tasks:
             slack_message += f"   - {assignee}: {count}\n"
     except Exception as e:
         slack_message += f"⚠️ Error fetching tasks by assignee: {e}\n"
 
-    # Send Slack message
-    send_slack_message("*Asana Status* \n\n" + slack_message)
+    send_slack_message("*Plane Status* \n\n" + slack_message)
 
 
 if __name__ == "__main__":
